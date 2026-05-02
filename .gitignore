@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Environment variables
+.env
+
+# Model files
+models/saved/*.pkl
+models/checkpoints/
+*.h5
+*.keras
+*.pt
+*.pth
+*.ckpt
+data
+# Reports generated automatically
+reports/figures/*.png
+reports/tables/*.csv
+reports/final_report.pdf
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+
+# OS generated files
+Thumbs.db
+
+# Kaggle API
+kaggle.json
+
+# Local experiment outputs
+outputs/
+wandb/
+mlruns/
+
+.coverage
+htmlcov/
+.pytest_cache/
+
+.cache/
+.DS_Store
