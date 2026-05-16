@@ -1,109 +1,109 @@
-from typing import Dict, Optional
+from typing import Dict, List
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from collections import defaultdict
 
 class MetadataFeatureExtractor:
     """
-    Extract structured metadata features from paper data
+    Extract and Scale structured metadata features from paper data.
     """
     def __init__(self):
         self.venue_encoder = LabelEncoder()
+        self.scaler = StandardScaler()
         self.is_fitted = False
-        self.author_freq = defaultdict(int) # author statistics
+        self.author_freq = defaultdict(int)
+        # Danh sách các cột cần được Scale (loại trừ các cột nhị phân has_...)
+        self.cols_to_scale = [
+            "venue_encoded", "year_norm", "author_count", 
+            "author_freq_mean", "author_freq_max", "author_freq_min"
+        ]
         
     def fit(self, df: pd.DataFrame):
         """
-        Fit venue encoder on training data only
+        Fit encoders and scaler on training data.
         """
+        # 1. Fit Venue
         if "venue" in df.columns:
             self.venue_encoder.fit(df["venue"].fillna("unknown"))
+            
+        # 2. Fit Author Frequencies
         if "authors" in df.columns:
             for authors in df["authors"].fillna(""):
-                for a in authors.split(","):
+                for a in str(authors).split(","):
                     a = a.strip()
                     if a:
                         self.author_freq[a] += 1
+        
+        # 3. Fit Scaler
+        # Chúng ta cần chạy transform tạm thời để lấy dữ liệu thô phục vụ việc fit scaler
+        raw_features = self._extract_raw_features(df)
+        self.scaler.fit(raw_features[self.cols_to_scale])
+        
         self.is_fitted = True
         return self
     
-    #author feature
     def _author_features(self, authors: str) -> Dict:
-        if not isinstance(authors, str):
-            authors = ""
-        authors = authors.strip()
-        if not authors:
-            return {
-                "author_count": 0,
-                "author_freq_mean": 0,
-                "author_freq_max": 0,
-                "author_freq_min": 0,
-            }
+        if not isinstance(authors, str) or not authors.strip():
+            return {"author_count": 0, "author_freq_mean": 0, "author_freq_max": 0, "author_freq_min": 0}
+        
         author_list = [a.strip() for a in authors.split(",") if a.strip()]
-        if not author_list:
-            return {
-                "author_count": 0,
-                "author_freq_mean": 0,
-                "author_freq_max": 0,
-                "author_freq_min": 0,
-            }
         freqs = [self.author_freq.get(a, 0) for a in author_list]
+        
         return {
             "author_count": len(author_list),
-            "author_freq_mean": float(np.mean(freqs)),
-            "author_freq_max": int(np.max(freqs)),
-            "author_freq_min": int(np.min(freqs)),
+            "author_freq_mean": float(np.mean(freqs)) if freqs else 0,
+            "author_freq_max": int(np.max(freqs)) if freqs else 0,
+            "author_freq_min": int(np.min(freqs)) if freqs else 0,
         }
-    
-    def transform_row(self, row: Dict) -> Dict:
+
+    def _extract_raw_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Convert a single paper into metadata features.
+        Hàm nội bộ để trích xuất feature chưa qua chuẩn hóa.
         """
-        venue = row.get("venue", "unknown")
-        year = row.get("year", 0)
-        authors = row.get("authors", "")
-        if not isinstance(authors, str):
-            authors = ""
-        
-        #venue
-        if self.is_fitted:
+        def process_row(row):
+            venue = row.get("venue", "unknown")
+            year = row.get("year", 0)
+            authors = str(row.get("authors", ""))
+            
+            # Venue encoding
             try:
-                venue_encoded = self.venue_encoder.transform([venue])[0]
+                v_enc = self.venue_encoder.transform([venue])[0] if self.is_fitted else -1
             except:
-                venue_encoded = -1
-        else:
-            venue_encoded = -1
-        #year
-        try:
-            year = int(year)
-        except:
-            year = 0
-        year_norm = (year - 2000) / 30  #scaling
-        
-        #authors
-        author_feats = self._author_features(authors)
-        
-        #flag missing
-        has_abstract = 1 if row.get("abstract") else 0
-        has_authors = 1 if author_feats["author_count"] > 0 else 0
-        
-        return {
-            "venue_encoded": venue_encoded,
-            "year_norm": year_norm,
+                v_enc = -1
+                
+            # Year normalization (tạm thời giữ nguyên logic cũ của bạn)
+            try:
+                year_val = int(year)
+            except:
+                year_val = 2000
+            y_norm = (year_val - 2000) / 30
             
-            "author_count": author_feats["author_count"],
-            "author_freq_mean": author_feats["author_freq_mean"],
-            "author_freq_max": author_feats["author_freq_max"],
-            "author_freq_min": author_feats["author_freq_min"],
+            auth_feats = self._author_features(authors)
             
-            "has_abstract": has_abstract,
-            "has_authors": has_authors
-        }
+            return {
+                "venue_encoded": v_enc,
+                "year_norm": y_norm,
+                "author_count": auth_feats["author_count"],
+                "author_freq_mean": auth_feats["author_freq_mean"],
+                "author_freq_max": auth_feats["author_freq_max"],
+                "author_freq_min": auth_feats["author_freq_min"],
+                "has_abstract": 1 if str(row.get("abstract", "")).strip() else 0,
+                "has_authors": 1 if auth_feats["author_count"] > 0 else 0
+            }
         
+        return df.apply(process_row, axis=1, result_type="expand")
+
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Convert full dataframe into metadata feature dataframe.
+        Extract features and apply StandardScaler.
         """
-        features = df.apply(self.transform_row, axis=1, result_type="expand")
-        return features
+        if not self.is_fitted:
+            raise RuntimeError("Extractor must be fitted before transform.")
+            
+        features_df = self._extract_raw_features(df)
+        
+        # Áp dụng chuẩn hóa cho các cột số
+        features_df[self.cols_to_scale] = self.scaler.transform(features_df[self.cols_to_scale])
+        
+        return features_df

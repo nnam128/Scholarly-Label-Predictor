@@ -25,10 +25,21 @@ CLEANED_TEST_PATH = BASE_DIR / "data" / "interim" / "cleaned_test.csv"
 FINAL_TRAIN_SVM_PATH = BASE_DIR / "data" / "processed" / "train_SVM_features.npz"
 FINAL_TEST_SVM_PATH = BASE_DIR / "data" / "processed" / "test_SVM_features.npz"
 
+FINAL_TRAIN_SBERT_PATH = BASE_DIR / "data" / "processed" / "train_SBERT_features.npy"
+FINAL_TEST_SBERT_PATH = BASE_DIR / "data" / "processed" / "test_SBERT_features.npy"
+
+FINAL_TRAIN_SBERT_PURE_PATH = BASE_DIR / "data" / "processed" / "train_SBERT.npy"
+FINAL_TEST_SBERT_PURE_PATH = BASE_DIR / "data" / "processed" / "test_SBERT.npy"
+
 TRAIN_LABEL_PATH = BASE_DIR / "data" / "processed" / "train_labels.csv"
 
 #SVM MODEL PATH
 SVM_MODEL_PATH = BASE_DIR / "models" / "saved" / "svm_model.pkl"
+GBM_MODEL_PATH = BASE_DIR / "models" / "saved" / "gbm_model.pkl"
+
 
 #SUBMISSION
 SUBMISSION_SVM_PATH = BASE_DIR / "data" / "submission" / "submission_baseline.csv"
+SUBMISSION_GBM_PATH = BASE_DIR / "data" / "submission" / "submission_sbert_gbm.csv"
+SUBMISSION_KNN_PATH = BASE_DIR / "data" / "submission" / "submission_sbert_knn.csv"
+SUBMISSION_PURE_SBERT_PATH = BASE_DIR / "data" / "submission" / "submission_pure_sbert_logreg.csv"
