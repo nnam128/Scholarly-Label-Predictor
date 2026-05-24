@@ -9,6 +9,10 @@ TEST_PATH_STAGE1 = BASE_DIR / "data" / "raw" / "Stage1" / "test (2).csv"
 
 SAMPLE_SUBMISSION_PATH_STAGE1 = BASE_DIR / "data" / "raw" / "Stage1" / "sample_submission_DM252.csv"
 
+TRAIN_PATH_STAGE2 = BASE_DIR / "data" / "raw" / "Stage2" / "train.csv"
+TEST_PATH_STAGE2 = BASE_DIR / "data" / "raw" / "Stage2" / "public_test.csv"
+SAMPLE_SUBMISSION_PATH_STAGE2 = BASE_DIR / "data" / "raw" / "Stage2" / "Test_Submission.csv"
+
 
 # EXTERNAL DATA
 CRAWLED_ABSTRACT_PATH = BASE_DIR / "data" / "external" / "crawled_abstracts.csv"
@@ -43,3 +47,5 @@ SUBMISSION_SVM_PATH = BASE_DIR / "data" / "submission" / "submission_baseline.cs
 SUBMISSION_GBM_PATH = BASE_DIR / "data" / "submission" / "submission_sbert_gbm.csv"
 SUBMISSION_KNN_PATH = BASE_DIR / "data" / "submission" / "submission_sbert_knn.csv"
 SUBMISSION_PURE_SBERT_PATH = BASE_DIR / "data" / "submission" / "submission_pure_sbert_logreg.csv"
+SUBMISSION_XGBOOST_PATH = BASE_DIR / "data" / "submission" / "submission_sbert_xgboost.csv"
+SUBMISSION_BERT_PATH = BASE_DIR / "data" / "submission" / "submission_bert.csv"

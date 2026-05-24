@@ -16,9 +16,9 @@ class DataMerger:
         if "abstract_crawl" in df.columns:
             df["abstract"] = df["abstract"].fillna(df["abstract_crawl"])
             
-        if "authors_crawl" in df.columns:
+        if "crawled_authors" in df.columns:
             mask = df["authors"].isna() | (df["authors"].fillna("").str.strip() == "")
-            df.loc[mask, "authors"] = df.loc[mask, "authors_crawl"]
+            df.loc[mask, "authors"] = df.loc[mask, "crawled_authors"]
             
         df.drop(
             columns=[c for c in df.columns if "_crawl" in c],
@@ -51,21 +51,20 @@ class MissingHandler:
     
 class AuthorNormalizer:
     def _clean(self, a: str) -> str:
-        a = a.lower().strip()
+        a = a.strip()
         a = re.sub(r"\s+", " ", a)
-        a = re.sub(r"[^a-z\s]", "", a)
+        # Chỉ xóa ký tự đặc biệt, giữ lại Unicode letters (Latin, Hy Lạp, etc.)
+        a = re.sub(r"[^\w\s]", "", a, flags=re.UNICODE)
         return a.strip()
     
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        
         def process(authors):
             if not isinstance(authors, str) or not authors.strip():
                 return ""
             parts = [self._clean(a) for a in authors.split(",")]
             parts = [p for p in parts if p]
             return ", ".join(parts)
-        
         df["authors"] = df["authors"].apply(process)
         return df
     

@@ -22,9 +22,12 @@ class SBERTFeatureExtractor:
         # Xử lý trường hợp abstract bị thiếu (NaN)
         titles = df['title'].fillna("").astype(str)
         abstracts = df['abstract'].fillna("").astype(str)
+        authors = df['authors'].fillna("").astype(str)
+        venue = df['venue'].fillna("").astype(str)
+        year = df['year'].fillna("").astype(str)
         
         # Format: "Title: ... Abstract: ..."
-        combined_text = "Title: " + titles + " [SEP] Abstract: " + abstracts
+        combined_text = "Title: " + titles + " [SEP] Abstract: " + abstracts + "Authors: " + authors + "Venue: " + venue + "Year: " + year
         return combined_text.tolist()
 
     def transform(self, df: pd.DataFrame):

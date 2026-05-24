@@ -28,14 +28,13 @@ ENV/
 .env
 
 # Model files
-models/saved/*.pkl
+models/saved/
 models/checkpoints/
 *.h5
 *.keras
 *.pt
 *.pth
 *.ckpt
-data
 # Reports generated automatically
 reports/figures/*.png
 reports/tables/*.csv
