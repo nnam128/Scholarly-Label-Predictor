@@ -28,11 +28,10 @@ ENV/
 .env
 
 # Model files
-models/saved/
 models/checkpoints/
 *.h5
 *.keras
-*.pt
+
 *.pth
 *.ckpt
 # Reports generated automatically
@@ -62,3 +61,10 @@ htmlcov/
 
 .cache/
 .DS_Store
+data/submission/*.csv
+models/
+*.pt
+*.pkl
+models/
+*.pt
+*.pkl
