@@ -2,6 +2,7 @@
 
 > **Data Mining (CO3117 / 252) — Ho Chi Minh University of Technology (HCMUT)**  
 > A competition to classify research papers in the field of Answer Set Programming (ASP)
+Competed in a two-stage Kaggle competition ([Data Mining 252 — Stage 2](https://www.kaggle.com/competitions/data-mining-252-stage-2/overview)) to classify 3,090 research papers into ordinal label categories, evaluated on Quadratic Weighted Kappa (QWK).
 
 ---
 
@@ -20,6 +21,8 @@ Predict the **category label** (`Label`, integer from 1–5) of research papers 
 Each paper includes: `id`, `Title`, `Authors`, `Venue`, `Year`, `DOI/Link`, `Label`.
 
 > **Key challenge**: the original dataset has **no abstracts** — abstracts were crawled from external APIs to enrich the data.
+
+🔗 **Competition page**: [Kaggle — Data Mining 252 Stage 2](https://www.kaggle.com/competitions/data-mining-252-stage-2/overview)
 
 ### Submission Format
 ```
