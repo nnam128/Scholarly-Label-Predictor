@@ -200,7 +200,7 @@ class BERTTrainer:
                 f"year: {year} "
                 f"authors: {authors_short} "
                 f"title: {title} "
-                #f"[SEP] abstract: {abstract}"
+                f"[SEP] abstract: {abstract}"
             )
         return texts
     
