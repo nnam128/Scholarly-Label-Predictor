@@ -24,11 +24,49 @@ print(f"Using device: {DEVICE}")
 NUM_WORKERS = 0 if DEVICE.type == "cpu" else 2
 
 
-# 1. Dataset
+# 1. Ordinal Distance Loss
+def ordinal_distance_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int = 5,
+    alpha: float = 0.75,
+    class_weights: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    CrossEntropy + Ordinal distance penalty.
+    Predict gần label thật bị phạt nhẹ hơn predict xa.
+    """
+    #  CrossEntropy chuẩn 
+    ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+    ce_loss = ce_loss_fn(logits, labels)
+    
+    #  Ordinal penalty
+    probs = torch.softmax(logits, dim=1)
+    
+    ranks = torch.arange(
+        num_classes,
+        device=logits.device,
+        dtype=torch.float32
+    )
+    
+    labels_expanded = labels.unsqueeze(1).float()
+    
+    # |pred_class - true_class|
+    distances = torch.abs(ranks.unsqueeze(0) - labels_expanded)
+    
+    # expected ordinal distance
+    expected_distance = (probs * distances).sum(dim=1).mean()
+    
+    loss = ce_loss + alpha * expected_distance
+    
+    return loss
+
+
+#  2. Dataset
 class PaperDataset(Dataset):
     """
     Nhận list texts và labels (tuỳ chọn).
-    Label ordinal: 1-5  →  shift về 0-4 để dùng CrossEntropy.
+    Label ordinal: 1-5 → shift về 0-4.
     """
     def __init__(
         self,
@@ -62,7 +100,7 @@ class PaperDataset(Dataset):
         return item
 
 
-# 2. Model — SciBERT + Classification head
+#  3. Model
 class BERTOrdinalClassifier(nn.Module):
     """
     SciBERT + dropout + linear head.
@@ -92,7 +130,7 @@ class BERTOrdinalClassifier(nn.Module):
         return self.classifier(cls)
 
 
-# 3. Trainer
+#  4. Trainer
 class BERTTrainer:
     """
     Fine-tune SciBERT cho bài ordinal classification (label 1-5).
@@ -166,7 +204,7 @@ class BERTTrainer:
             )
         return texts
     
-    #  Train 1 fold
+    #  train 1 fold 
     def _train_fold(self, train_loader, val_loader, fold: int):
         model = BERTOrdinalClassifier(
             model_name=self.model_name,
