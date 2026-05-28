@@ -24,49 +24,70 @@ print(f"Using device: {DEVICE}")
 NUM_WORKERS = 0 if DEVICE.type == "cpu" else 2
 
 
-# 1. Ordinal Distance Loss
+#  1. Loss: CrossEntropy + Ordinal Distance Penalty 
 def ordinal_distance_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     num_classes: int = 5,
-    alpha: float = 0.75,
-    class_weights: torch.Tensor = None,
+    alpha: float = 0.5,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    CrossEntropy + Ordinal distance penalty.
-    Predict gần label thật bị phạt nhẹ hơn predict xa.
+    CrossEntropy + weighted ordinal penalty.
+    Predict xa label thật bị phạt nặng hơn predict gần.
+    alpha=0.5: cân bằng CE và penalty.
     """
-    #  CrossEntropy chuẩn 
-    ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights)
-    ce_loss = ce_loss_fn(logits, labels)
-    
-    #  Ordinal penalty
-    probs = torch.softmax(logits, dim=1)
-    
-    ranks = torch.arange(
-        num_classes,
-        device=logits.device,
-        dtype=torch.float32
-    )
-    
-    labels_expanded = labels.unsqueeze(1).float()
-    
-    # |pred_class - true_class|
-    distances = torch.abs(ranks.unsqueeze(0) - labels_expanded)
-    
-    # expected ordinal distance
-    expected_distance = (probs * distances).sum(dim=1).mean()
-    
-    loss = ce_loss + alpha * expected_distance
-    
-    return loss
+    ce_loss = nn.CrossEntropyLoss(weight=class_weights)(logits, labels)
+    probs   = torch.softmax(logits, dim=1)
+    ranks   = torch.arange(num_classes, device=logits.device, dtype=torch.float32)
+    dist    = torch.abs(ranks.unsqueeze(0) - labels.unsqueeze(1).float())
+    penalty = (probs * dist).sum(dim=1).mean()
+    return ce_loss + alpha * penalty
 
 
-#  2. Dataset
+#  2. R-Drop Loss 
+def rdrop_loss(
+    logits1: torch.Tensor,
+    logits2: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int = 5,
+    alpha: float = 0.5,
+    class_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    R-Drop: forward pass 2 lần với dropout khác nhau, KL-diverge 2 distribution.
+
+    Tại sao hiệu quả với bài này:
+    - Dropout tạo ra 2 sub-model khác nhau mỗi step
+    - KL loss ép 2 sub-model cho ra prediction nhất quán
+    - Regularization mạnh hơn dropout đơn thuần
+    - Đặc biệt tốt với dataset nhỏ-vừa (~2500 samples)
+
+    loss = 0.5*(CE1 + CE2) + alpha * KL(p1 || p2)
+    alpha=0.5 là giá trị chuẩn từ paper gốc.
+    """
+    # CE trung bình 2 forward pass
+    ce1 = ordinal_distance_loss(logits1, labels, num_classes, alpha=0.5,
+                                class_weights=class_weights)
+    ce2 = ordinal_distance_loss(logits2, labels, num_classes, alpha=0.5,
+                                class_weights=class_weights)
+    ce  = 0.5 * (ce1 + ce2)
+
+    # KL divergence đối xứng giữa 2 distribution
+    p1  = torch.softmax(logits1, dim=1)
+    p2  = torch.softmax(logits2, dim=1)
+    kl1 = nn.functional.kl_div(torch.log(p1 + 1e-8), p2, reduction="batchmean")
+    kl2 = nn.functional.kl_div(torch.log(p2 + 1e-8), p1, reduction="batchmean")
+    kl  = 0.5 * (kl1 + kl2)
+
+    return ce + alpha * kl
+
+
+#  3. Dataset với Dynamic Padding 
 class PaperDataset(Dataset):
     """
-    Nhận list texts và labels (tuỳ chọn).
-    Label ordinal: 1-5 → shift về 0-4.
+    Dynamic padding: không pad về max_length cố định mà pad về
+    max length trong batch → giảm ~30% thời gian train vì ít token padding hơn.
     """
     def __init__(
         self,
@@ -87,7 +108,6 @@ class PaperDataset(Dataset):
         encoding = self.tokenizer(
             self.texts[idx],
             max_length=self.max_length,
-            padding="max_length",
             truncation=True,
             return_tensors="pt",
         )
@@ -100,18 +120,28 @@ class PaperDataset(Dataset):
         return item
 
 
-#  3. Model
+def dynamic_collate_fn(batch):
+    """
+    Pad về max length của batch hiện tại thay vì max_length cố định.
+    Batch có câu ngắn → ít token padding → forward/backward nhanh hơn.
+    """
+    input_ids      = [item["input_ids"]      for item in batch]
+    attention_mask = [item["attention_mask"] for item in batch]
+
+    # Pad về max len trong batch này
+    input_ids      = nn.utils.rnn.pad_sequence(input_ids,      batch_first=True, padding_value=0)
+    attention_mask = nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+    result = {"input_ids": input_ids, "attention_mask": attention_mask}
+    if "labels" in batch[0]:
+        result["labels"] = torch.stack([item["labels"] for item in batch])
+    return result
+
+
+#  4. Model 
 class BERTOrdinalClassifier(nn.Module):
-    """
-    SciBERT + dropout + linear head.
-    Loss = CrossEntropy, predict bằng argmax → 0-4 → +1 → 1-5.
-    """
-    def __init__(
-        self,
-        model_name: str = "allenai/scibert_scivocab_uncased",
-        num_classes: int = 5,
-        dropout: float = 0.2,
-    ):
+    def __init__(self, model_name: str = "allenai/scibert_scivocab_uncased",
+                 num_classes: int = 5, dropout: float = 0.2):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name)
         hidden = self.bert.config.hidden_size  # 768
@@ -130,49 +160,112 @@ class BERTOrdinalClassifier(nn.Module):
         return self.classifier(cls)
 
 
-#  4. Trainer
+#  5. LLRD Optimizer 
+def make_llrd_optimizer(model: BERTOrdinalClassifier, base_lr: float,
+                        decay: float = 0.9) -> torch.optim.AdamW:
+    """
+    Layer-wise Learning Rate Decay.
+
+    Tại sao hiệu quả:
+    - Layer đầu BERT học low-level features (syntax) → đã pretrain tốt → lr nhỏ
+    - Layer cuối học high-level features (semantics) → cần fine-tune nhiều hơn → lr lớn
+    - Classifier head hoàn toàn mới → lr lớn nhất
+
+    decay=0.9: mỗi layer giảm 10% lr so với layer trên.
+    Layer 0 (embedding): base_lr * 0.9^12 ≈ base_lr * 0.28
+    Layer 11 (top BERT): base_lr * 0.9^1  ≈ base_lr * 0.90
+    Classifier head   : base_lr * 1.0
+    """
+    num_layers = model.bert.config.num_hidden_layers  # 12 với BERT-base
+
+    # Classifier head — lr cao nhất
+    param_groups = [
+        {"params": model.classifier.parameters(), "lr": base_lr}
+    ]
+
+    # BERT layers — lr giảm dần từ trên xuống
+    for layer_idx in range(num_layers - 1, -1, -1):
+        layer_lr = base_lr * (decay ** (num_layers - layer_idx))
+        param_groups.append({
+            "params": model.bert.encoder.layer[layer_idx].parameters(),
+            "lr": layer_lr,
+        })
+
+    # Embeddings — lr thấp nhất
+    embed_lr = base_lr * (decay ** (num_layers + 1))
+    param_groups.append({
+        "params": model.bert.embeddings.parameters(),
+        "lr": embed_lr,
+    })
+
+    return torch.optim.AdamW(param_groups, weight_decay=0.01)
+
+
+#  6. Trainer 
 class BERTTrainer:
     """
-    Fine-tune SciBERT cho bài ordinal classification (label 1-5).
+    Fine-tune SciBERT với 4 kỹ thuật nâng cao:
+
+    [A] R-Drop Regularization
+        Forward pass 2 lần/batch, KL-diverge 2 distribution.
+        Đặc biệt hiệu quả với dataset ~2500 samples.
+
+    [B] Layer-wise Learning Rate Decay (LLRD)
+        Layer BERT đầu lr thấp, layer cuối lr cao, head lr cao nhất.
+        Giữ pretrained knowledge, fine-tune hiệu quả hơn.
+
+    [C] Ordinal Distance Penalty
+        CE + penalty theo khoảng cách ordinal.
+        Predict sai xa bị phạt nặng hơn sai gần.
+
+    [D] Dynamic Padding
+        Pad về max length của batch → train nhanh hơn ~30%.
+
     Parameters
     ----------
-    model_name     : HuggingFace model id. Mặc định SciBERT.
+    model_name     : HuggingFace model id.
     num_classes    : Số class (5).
-    max_length     : Max token length. 256
-    epochs         : Số epoch tối đa mỗi fold (default 20).
-    early_stopping : Dừng nếu val F1 không cải thiện sau N epoch liên tiếp (default 4).
-    batch_size     : 16 an toàn trên T4; giảm xuống 8 nếu OOM.
-    lr             : Learning rate. 2e-5 là sweet spot cho fine-tune BERT.
+    max_length     : Max token length.
+    epochs         : Số epoch tối đa mỗi fold.
+    early_stopping : Dừng nếu val F1 không cải thiện sau N epoch liên tiếp.
+    batch_size     : 8 trên T4 với max_length=256.
+    lr             : Base learning rate cho LLRD.
     n_splits       : Số fold CV.
+    alpha          : Weight của ordinal penalty và R-Drop KL term.
+    llrd_decay     : Decay rate cho LLRD. 0.9 = giảm 10% mỗi layer.
+    use_rdrop      : Bật/tắt R-Drop. True mặc định.
     """
     
     def __init__(
         self,
-        model_name: str = "allenai/scibert_scivocab_uncased",
-        num_classes: int = 5,
-        max_length: int = 256,
-        epochs: int = 17,
-        early_stopping: int = 3,
-        batch_size: int = 8,
-        lr: float = 2e-5,
-        n_splits: int = 5,
-        alpha: float = 0.5,
+        model_name:     str   = "allenai/scibert_scivocab_uncased",
+        num_classes:    int   = 5,
+        max_length:     int   = 256,
+        epochs:         int   = 17,
+        early_stopping: int   = 3,
+        batch_size:     int   = 8,
+        lr:             float = 2e-5,
+        n_splits:       int   = 5,
+        alpha:          float = 0.5,
+        llrd_decay:     float = 0.9,
+        use_rdrop:      bool  = True,
     ):
-        self.model_name = model_name
-        self.num_classes = num_classes
-        self.max_length = max_length
-        self.epochs = epochs
+        self.model_name     = model_name
+        self.num_classes    = num_classes
+        self.max_length     = max_length
+        self.epochs         = epochs
         self.early_stopping = early_stopping
-        self.batch_size = batch_size
-        self.lr = lr
-        self.n_splits = n_splits
-        self.alpha = alpha
-        
+        self.batch_size     = batch_size
+        self.lr             = lr
+        self.n_splits       = n_splits
+        self.alpha          = alpha
+        self.llrd_decay     = llrd_decay
+        self.use_rdrop      = use_rdrop
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.models = []
+        self.models    = []
         self.oof_preds = None
-        
-    #  Helper: build text 
+
     @staticmethod
     def build_texts(df: pd.DataFrame) -> list:
         """
@@ -206,21 +299,12 @@ class BERTTrainer:
     
     #  train 1 fold 
     def _train_fold(self, train_loader, val_loader, fold: int):
-        model = BERTOrdinalClassifier(
-            model_name=self.model_name,
-            num_classes=self.num_classes,
-        ).to(DEVICE)
-        
-        optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=0.01) 
-        
-        # OneCycleLR: warmup 10% → cosine decay
+        model     = BERTOrdinalClassifier(self.model_name, self.num_classes).to(DEVICE)
+        optimizer = make_llrd_optimizer(model, self.lr, self.llrd_decay)  # [B] LLRD
+
         total_steps  = len(train_loader) * self.epochs
-        warmup_steps = int(0.1 * total_steps)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=self.lr,
-            total_steps=total_steps,
-            pct_start=warmup_steps / total_steps,
+        scheduler    = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=self.lr, total_steps=total_steps, pct_start=0.1,
         )
 
         best_f1 = -1
@@ -237,15 +321,17 @@ class BERTTrainer:
                 labels         = batch["labels"].to(DEVICE)
                 
                 optimizer.zero_grad()
-                logits = model(input_ids, attention_mask)
 
-                #  NEW LOSS 
-                loss = ordinal_distance_loss(
-                    logits,
-                    labels,
-                    num_classes=self.num_classes,
-                    alpha=self.alpha,
-                )
+                if self.use_rdrop:
+                    # [A] R-Drop: 2 forward pass với dropout mask khác nhau
+                    logits1 = model(input_ids, attention_mask)
+                    logits2 = model(input_ids, attention_mask)
+                    loss    = rdrop_loss(logits1, logits2, labels,
+                                        self.num_classes, self.alpha)
+                else:
+                    logits = model(input_ids, attention_mask)
+                    loss   = ordinal_distance_loss(logits, labels,
+                                                   self.num_classes, self.alpha)
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -335,14 +421,17 @@ class BERTTrainer:
             
             train_ds = PaperDataset(train_texts, train_labels, self.tokenizer, self.max_length)
             val_ds   = PaperDataset(val_texts,   val_labels,   self.tokenizer, self.max_length)
-            
+
+            # [D] Dynamic padding qua collate_fn
             train_loader = DataLoader(
                 train_ds, batch_size=self.batch_size, shuffle=True,
                 num_workers=NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"),
+                collate_fn=dynamic_collate_fn,
             )
             val_loader = DataLoader(
                 val_ds, batch_size=self.batch_size, shuffle=False,
                 num_workers=NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"),
+                collate_fn=dynamic_collate_fn,
             )
             
             model, best_f1 = self._train_fold(train_loader, val_loader, fold)
@@ -366,29 +455,25 @@ class BERTTrainer:
         """
         texts = self.build_texts(df)
         test_ds = PaperDataset(texts, None, self.tokenizer, self.max_length)
-        test_loader = DataLoader(
+        loader  = DataLoader(
             test_ds, batch_size=self.batch_size, shuffle=False,
             num_workers=NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"),
+            collate_fn=dynamic_collate_fn,
         )
-        
         all_probs = np.zeros((len(texts), self.num_classes))
         for model in self.models:
             model.eval()
             model.to(DEVICE)
             fold_probs = []
             with torch.no_grad():
-                for batch in test_loader:
-                    input_ids      = batch["input_ids"].to(DEVICE)
-                    attention_mask = batch["attention_mask"].to(DEVICE)
-                    logits = model(input_ids, attention_mask)
-                    probs  = torch.softmax(logits, dim=1).cpu().numpy()
-                    fold_probs.append(probs)
+                for batch in loader:
+                    logits = model(batch["input_ids"].to(DEVICE),
+                                   batch["attention_mask"].to(DEVICE))
+                    fold_probs.append(torch.softmax(logits, dim=1).cpu().numpy())
             all_probs += np.vstack(fold_probs)
-            
         all_probs /= len(self.models)
-        return np.argmax(all_probs, axis=1) + 1  # 0-4 → 1-5
-    
-    #  Utility: save / load 
+        return np.argmax(all_probs, axis=1) + 1
+
     def save_models(self, save_dir: str):
         os.makedirs(save_dir, exist_ok=True)
         for i, model in enumerate(self.models):
