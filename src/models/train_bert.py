@@ -1,7 +1,7 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"  # tắt fork warning từ HuggingFace tokenizers
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import numpy as np
 import pandas as pd
@@ -72,7 +72,7 @@ class BERTOrdinalClassifier(nn.Module):
         self,
         model_name: str = "allenai/scibert_scivocab_uncased",
         num_classes: int = 5,
-        dropout: float = 0.3,
+        dropout: float = 0.2,
     ):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name)
@@ -118,6 +118,7 @@ class BERTTrainer:
         batch_size: int = 8,
         lr: float = 2e-5,
         n_splits: int = 5,
+        alpha: float = 0.5,
     ):
         self.model_name = model_name
         self.num_classes = num_classes
@@ -127,6 +128,7 @@ class BERTTrainer:
         self.batch_size = batch_size
         self.lr = lr
         self.n_splits = n_splits
+        self.alpha = alpha
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.models = []
@@ -156,11 +158,11 @@ class BERTTrainer:
                 authors_short += " et al."
                 
             texts.append(
-                f"venue: {venue} "
+                #f"venue: {venue} "
                 f"year: {year} "
                 f"authors: {authors_short} "
-                f"{title} ( {venue} ) "
-                f"[SEP] {abstract}"
+                f"title: {title} "
+                #f"[SEP] abstract: {abstract}"
             )
         return texts
     
@@ -182,9 +184,8 @@ class BERTTrainer:
             total_steps=total_steps,
             pct_start=warmup_steps / total_steps,
         )
-        
-        criterion  = nn.CrossEntropyLoss()
-        best_f1    = -1
+
+        best_f1 = -1
         best_state = None
         no_improve = 0
         
@@ -199,7 +200,15 @@ class BERTTrainer:
                 
                 optimizer.zero_grad()
                 logits = model(input_ids, attention_mask)
-                loss   = criterion(logits, labels)
+
+                #  NEW LOSS 
+                loss = ordinal_distance_loss(
+                    logits,
+                    labels,
+                    num_classes=self.num_classes,
+                    alpha=self.alpha,
+                )
+
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -209,12 +218,30 @@ class BERTTrainer:
             avg_loss = total_loss / len(train_loader)
             
             #  validate 
-            val_preds, val_labels = self._predict_loader(model, val_loader)
-            val_f1 = f1_score(val_labels + 1, val_preds + 1, average="macro")
-            
-            flag = "✔ best" if val_f1 > best_f1 else f"  (no improve {no_improve+1}/{self.early_stopping})"
-            print(f"  Epoch {epoch+1:>2}/{self.epochs}  loss={avg_loss:.4f}  val_macro_f1={val_f1:.4f}  {flag}")
-            
+            val_preds, val_labels = self._predict_loader(
+                model,
+                val_loader
+            )
+
+            val_f1 = f1_score(
+                val_labels + 1,
+                val_preds + 1,
+                average="macro"
+            )
+
+            flag = (
+                "✔ best"
+                if val_f1 > best_f1
+                else f"(no improve {no_improve+1}/{self.early_stopping})"
+            )
+
+            print(
+                f"  Epoch {epoch+1:>2}/{self.epochs} "
+                f"loss={avg_loss:.4f} "
+                f"val_macro_f1={val_f1:.4f} "
+                f"{flag}"
+            )
+
             if val_f1 > best_f1:
                 best_f1    = val_f1
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}

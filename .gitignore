@@ -62,9 +62,6 @@ htmlcov/
 .cache/
 .DS_Store
 data/submission/*.csv
-models/
-*.pt
-*.pkl
-models/
+/models/
 *.pt
 *.pkl
