@@ -284,7 +284,7 @@ class BERTTrainer:
                     break
 
         model.load_state_dict(best_state)
-        return model, best_val_loss
+        return model, best_qwk
 
     @staticmethod
     def _predict_loader(model, loader) -> tuple:
