@@ -6,7 +6,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, cohen_kappa_score
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
@@ -19,13 +19,25 @@ warnings.filterwarnings("ignore")
 #  Device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
-
-# num_workers=0 trên CPU để tránh fork/deadlock, 2 khi có GPU
 NUM_WORKERS = 0 if DEVICE.type == "cpu" else 2
 
 
-#  1. Loss: CrossEntropy + Ordinal Distance Penalty 
-def ordinal_distance_loss(
+# ── [4] Class weights helper ───────────────────────────────────────────────────
+def compute_class_weights(labels: np.ndarray, num_classes: int) -> torch.Tensor:
+    """
+    Inverse-frequency weights, normalize về mean=1.
+    Label 1 (nhiều) → weight thấp, Label 5 (ít) → weight cao.
+    Truyền vào CrossEntropy để bù imbalance 3.3x.
+    """
+    counts  = np.bincount(labels - 1, minlength=num_classes).astype(float)
+    weights = len(labels) / (num_classes * counts)
+    weights = weights / weights.mean()
+    print(f"Class weights: { {i+1: round(w,3) for i,w in enumerate(weights)} }")
+    return torch.tensor(weights, dtype=torch.float32).to(DEVICE)
+
+
+# ── [1] QWK Surrogate Loss ─────────────────────────────────────────────────────
+def qwk_surrogate_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     num_classes: int = 5,
@@ -33,19 +45,35 @@ def ordinal_distance_loss(
     class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    CrossEntropy + weighted ordinal penalty.
-    Predict xa label thật bị phạt nặng hơn predict gần.
-    alpha=0.5: cân bằng CE và penalty.
+    QWK Surrogate = CrossEntropy + Expected-rank penalty có trọng số bậc 2.
+
+    QWK phạt sai lệch theo bậc 2: sai 2 bậc nặng gấp 4 lần sai 1 bậc.
+    Penalty dưới đây mô phỏng đúng tính chất này:
+        penalty = E[((pred_rank - true_rank) / (num_classes-1))^2]
+               = sum_k p_k * ((k - y) / (C-1))^2
+
+    So với ordinal_distance_loss dùng |k-y| tuyến tính,
+    QWK surrogate dùng (k-y)^2 bậc 2 — đúng với công thức QWK gốc.
+
+    class_weights: truyền vào CE để xử lý imbalance.
+    alpha=0.5: cân bằng CE và QWK penalty.
     """
     ce_loss = nn.CrossEntropyLoss(weight=class_weights)(logits, labels)
-    probs   = torch.softmax(logits, dim=1)
-    ranks   = torch.arange(num_classes, device=logits.device, dtype=torch.float32)
-    dist    = torch.abs(ranks.unsqueeze(0) - labels.unsqueeze(1).float())
-    penalty = (probs * dist).sum(dim=1).mean()
+
+    probs  = torch.softmax(logits, dim=1)                          # (B, C)
+    ranks  = torch.arange(num_classes, device=logits.device,
+                          dtype=torch.float32)                     # (C,)
+    y      = labels.float()                                        # (B,)
+    scale  = (num_classes - 1) ** 2                               # normalize như QWK
+
+    # (B, C): bình phương khoảng cách từ mỗi rank đến true label
+    sq_dist = ((ranks.unsqueeze(0) - y.unsqueeze(1)) ** 2) / scale
+    penalty = (probs * sq_dist).sum(dim=1).mean()
+
     return ce_loss + alpha * penalty
 
 
-#  2. R-Drop Loss 
+#  1. Loss: R-Drop (giữ nguyên, chỉ đổi inner loss sang QWK surrogate)
 def rdrop_loss(
     logits1: torch.Tensor,
     logits2: torch.Tensor,
@@ -55,25 +83,15 @@ def rdrop_loss(
     class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    R-Drop: forward pass 2 lần với dropout khác nhau, KL-diverge 2 distribution.
-
-    Tại sao hiệu quả với bài này:
-    - Dropout tạo ra 2 sub-model khác nhau mỗi step
-    - KL loss ép 2 sub-model cho ra prediction nhất quán
-    - Regularization mạnh hơn dropout đơn thuần
-    - Đặc biệt tốt với dataset nhỏ-vừa (~2500 samples)
-
-    loss = 0.5*(CE1 + CE2) + alpha * KL(p1 || p2)
-    alpha=0.5 là giá trị chuẩn từ paper gốc.
+    R-Drop với QWK surrogate loss bên trong.
+    loss = 0.5*(QWK1 + QWK2) + alpha * KL(p1 || p2)
     """
-    # CE trung bình 2 forward pass
-    ce1 = ordinal_distance_loss(logits1, labels, num_classes, alpha=0.5,
-                                class_weights=class_weights)
-    ce2 = ordinal_distance_loss(logits2, labels, num_classes, alpha=0.5,
-                                class_weights=class_weights)
+    ce1 = qwk_surrogate_loss(logits1, labels, num_classes, alpha=0.5,
+                             class_weights=class_weights)
+    ce2 = qwk_surrogate_loss(logits2, labels, num_classes, alpha=0.5,
+                             class_weights=class_weights)
     ce  = 0.5 * (ce1 + ce2)
 
-    # KL divergence đối xứng giữa 2 distribution
     p1  = torch.softmax(logits1, dim=1)
     p2  = torch.softmax(logits2, dim=1)
     kl1 = nn.functional.kl_div(torch.log(p1 + 1e-8), p2, reduction="batchmean")
@@ -83,7 +101,7 @@ def rdrop_loss(
     return ce + alpha * kl
 
 
-#  3. Dataset với Dynamic Padding 
+#  3. Dataset với Dynamic Padding
 class PaperDataset(Dataset):
     """
     Dynamic padding: không pad về max_length cố định mà pad về
@@ -138,8 +156,18 @@ def dynamic_collate_fn(batch):
     return result
 
 
-#  4. Model 
+# ── [2] Model với Mean Pooling ─────────────────────────────────────────────────
 class BERTOrdinalClassifier(nn.Module):
+    """
+    Mean pooling thay CLS pooling.
+
+    Tại sao mean pooling tốt hơn cho scientific text:
+    - CLS token được train cho NSP task (không có trong SciBERT) → representation kém
+    - Mean pooling lấy trung bình tất cả token (trừ padding) → capture toàn bộ context
+    - Với title-only text (~20-40 token), mean pooling ổn định hơn CLS
+
+    attention_mask dùng để mask padding token trước khi mean.
+    """
     def __init__(self, model_name: str = "allenai/scibert_scivocab_uncased",
                  num_classes: int = 5, dropout: float = 0.2):
         super().__init__()
@@ -155,12 +183,19 @@ class BERTOrdinalClassifier(nn.Module):
         )
         
     def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        cls = outputs.last_hidden_state[:, 0, :]  # CLS token
-        return self.classifier(cls)
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+
+        # [2] Mean pooling — trung bình các token thực (bỏ padding)
+        token_emb = out.last_hidden_state                          # (B, L, H)
+        mask      = attention_mask.unsqueeze(-1).float()           # (B, L, 1)
+        sum_emb   = (token_emb * mask).sum(dim=1)                  # (B, H)
+        count     = mask.sum(dim=1).clamp(min=1e-9)               # (B, 1)
+        pooled    = sum_emb / count                                # (B, H)
+
+        return self.classifier(pooled)
 
 
-#  5. LLRD Optimizer 
+#  5. LLRD Optimizer
 def make_llrd_optimizer(model: BERTOrdinalClassifier, base_lr: float,
                         decay: float = 0.9) -> torch.optim.AdamW:
     """
@@ -201,41 +236,42 @@ def make_llrd_optimizer(model: BERTOrdinalClassifier, base_lr: float,
     return torch.optim.AdamW(param_groups, weight_decay=0.01)
 
 
-#  6. Trainer 
+# ── [3] Expected-rank decoding ─────────────────────────────────────────────────
+def expected_rank_decode(probs: np.ndarray, num_classes: int = 5) -> np.ndarray:
+    """
+    Thay argmax bằng kỳ vọng của phân phối rồi làm tròn.
+
+    argmax chọn class có prob cao nhất → bỏ qua thông tin ordinal.
+    Expected rank = sum_k (k * p_k) → dùng toàn bộ distribution.
+
+    Ví dụ: probs = [0.1, 0.4, 0.4, 0.1, 0.0]
+        argmax       → class 1 hoặc 2 (tie, lấy đầu tiên)
+        expected rank → 0.1*0 + 0.4*1 + 0.4*2 + 0.1*3 = 1.5 → round → 2
+
+    Đặc biệt hữu ích khi probability mass trải đều giữa 2 class liền kề.
+    Trả về label 1-5 (0-based rank + 1).
+    """
+    ranks = np.arange(num_classes)                    # [0,1,2,3,4]
+    exp   = (probs * ranks).sum(axis=1)               # (N,) float
+    return np.clip(np.round(exp).astype(int), 0, num_classes - 1) + 1  # 1-5
+
+
+#  6. Trainer
 class BERTTrainer:
     """
-    Fine-tune SciBERT với 4 kỹ thuật nâng cao:
-
+    Fine-tune SciBERT với các kỹ thuật:
     [A] R-Drop Regularization
-        Forward pass 2 lần/batch, KL-diverge 2 distribution.
-        Đặc biệt hiệu quả với dataset ~2500 samples.
-
-    [B] Layer-wise Learning Rate Decay (LLRD)
-        Layer BERT đầu lr thấp, layer cuối lr cao, head lr cao nhất.
-        Giữ pretrained knowledge, fine-tune hiệu quả hơn.
-
-    [C] Ordinal Distance Penalty
-        CE + penalty theo khoảng cách ordinal.
-        Predict sai xa bị phạt nặng hơn sai gần.
-
+    [B] LLRD Optimizer
+    [C] QWK Surrogate Loss  ← đổi từ ordinal_distance_loss
     [D] Dynamic Padding
-        Pad về max length của batch → train nhanh hơn ~30%.
+    [E] Mean Pooling         ← đổi từ CLS pooling
+    [F] Class Weights        ← thêm mới
+    [G] Expected-rank decode ← đổi từ argmax
 
-    Parameters
-    ----------
-    model_name     : HuggingFace model id.
-    num_classes    : Số class (5).
-    max_length     : Max token length.
-    epochs         : Số epoch tối đa mỗi fold.
-    early_stopping : Dừng nếu val F1 không cải thiện sau N epoch liên tiếp.
-    batch_size     : 8 trên T4 với max_length=256.
-    lr             : Base learning rate cho LLRD.
-    n_splits       : Số fold CV.
-    alpha          : Weight của ordinal penalty và R-Drop KL term.
-    llrd_decay     : Decay rate cho LLRD. 0.9 = giảm 10% mỗi layer.
-    use_rdrop      : Bật/tắt R-Drop. True mặc định.
+    Val metric: QWK (cohen_kappa_score quadratic) thay vì Macro F1
+    vì leaderboard dùng QWK.
     """
-    
+
     def __init__(
         self,
         model_name:     str   = "allenai/scibert_scivocab_uncased",
@@ -262,18 +298,13 @@ class BERTTrainer:
         self.llrd_decay     = llrd_decay
         self.use_rdrop      = use_rdrop
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.models    = []
-        self.oof_preds = None
+        self.tokenizer     = AutoTokenizer.from_pretrained(model_name)
+        self.models        = []
+        self.oof_preds     = None
+        self.class_weights = None   # set trong train()
 
     @staticmethod
     def build_texts(df: pd.DataFrame) -> list:
-        """
-        Ghép tất cả cột có ý nghĩa thành 1 chuỗi đầu vào cho BERT.
-        Format:
-            venue: <v> year: <y> authors: <a> <title> ( <v> ) [SEP] <abstract>
-        Abstract dài đặt cuối — truncation cắt ở đây nếu quá max_length.
-        """
         texts = []
         for _, row in df.iterrows():
             title    = str(row.get("title",    "")).strip()
@@ -293,7 +324,7 @@ class BERTTrainer:
                 f"year: {year} "
                 f"authors: {authors_short} "
                 f"title: {title} "
-                f"[SEP] abstract: {abstract}"
+                #f"[SEP] abstract: {abstract}"
             )
         return texts
     
@@ -307,7 +338,7 @@ class BERTTrainer:
             optimizer, max_lr=self.lr, total_steps=total_steps, pct_start=0.1,
         )
 
-        best_f1 = -1
+        best_qwk   = -1
         best_state = None
         no_improve = 0
         
@@ -323,79 +354,73 @@ class BERTTrainer:
                 optimizer.zero_grad()
 
                 if self.use_rdrop:
-                    # [A] R-Drop: 2 forward pass với dropout mask khác nhau
                     logits1 = model(input_ids, attention_mask)
                     logits2 = model(input_ids, attention_mask)
                     loss    = rdrop_loss(logits1, logits2, labels,
-                                        self.num_classes, self.alpha)
+                                        self.num_classes, self.alpha,
+                                        self.class_weights)
                 else:
                     logits = model(input_ids, attention_mask)
-                    loss   = ordinal_distance_loss(logits, labels,
-                                                   self.num_classes, self.alpha)
+                    loss   = qwk_surrogate_loss(logits, labels,
+                                                self.num_classes, self.alpha,
+                                                self.class_weights)
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 total_loss += loss.item()
-                
+
             avg_loss = total_loss / len(train_loader)
-            
-            #  validate 
-            val_preds, val_labels = self._predict_loader(
-                model,
-                val_loader
-            )
 
-            val_f1 = f1_score(
-                val_labels + 1,
-                val_preds + 1,
-                average="macro"
-            )
+            # [G] Validate bằng QWK + expected-rank decode
+            val_preds, val_labels = self._predict_loader(model, val_loader)
+            val_qwk = cohen_kappa_score(val_labels + 1, val_preds,
+                                        weights="quadratic")
+            val_f1  = f1_score(val_labels + 1, val_preds, average="macro")
 
-            flag = (
-                "✔ best"
-                if val_f1 > best_f1
-                else f"(no improve {no_improve+1}/{self.early_stopping})"
-            )
+            flag = ("✔ best" if val_qwk > best_qwk
+                    else f"(no improve {no_improve+1}/{self.early_stopping})")
+            print(f"  Epoch {epoch+1:>2}/{self.epochs} "
+                  f"loss={avg_loss:.4f} "
+                  f"val_qwk={val_qwk:.4f} "
+                  f"val_f1={val_f1:.4f} "
+                  f"{flag}")
 
-            print(
-                f"  Epoch {epoch+1:>2}/{self.epochs} "
-                f"loss={avg_loss:.4f} "
-                f"val_macro_f1={val_f1:.4f} "
-                f"{flag}"
-            )
-
-            if val_f1 > best_f1:
-                best_f1    = val_f1
+            if val_qwk > best_qwk:
+                best_qwk, no_improve = val_qwk, 0
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                no_improve = 0
             else:
                 no_improve += 1
                 if no_improve >= self.early_stopping:
                     print(f"  ⏹ Early stopping tại epoch {epoch+1}")
                     break
-                
+
         model.load_state_dict(best_state)
-        return model, best_f1
-    
-    #  Predict từ DataLoader 
+        return model, best_qwk
+
     @staticmethod
-    def _predict_loader(model, loader):
+    def _predict_loader(model, loader) -> tuple:
+        """
+        Trả về (preds_1to5, labels_0based).
+        preds dùng expected-rank decode thay argmax.
+        """
         model.eval()
-        all_preds, all_labels = [], []
+        all_probs, all_labels = [], []
         with torch.no_grad():
             for batch in loader:
                 input_ids      = batch["input_ids"].to(DEVICE)
                 attention_mask = batch["attention_mask"].to(DEVICE)
                 logits = model(input_ids, attention_mask)
-                preds  = torch.argmax(logits, dim=1).cpu().numpy()
-                all_preds.extend(preds)
+                probs  = torch.softmax(logits, dim=1).cpu().numpy()
+                all_probs.append(probs)
                 if "labels" in batch:
                     all_labels.extend(batch["labels"].numpy())
-        return np.array(all_preds), np.array(all_labels)
-    
-    #  Public: train với Stratified K-Fold CV 
+
+        all_probs = np.vstack(all_probs)                           # (N, C)
+        preds     = expected_rank_decode(all_probs, model.classifier[-1].out_features)
+        return preds, np.array(all_labels)
+
     def train(self, df: pd.DataFrame, label_col: str = "label"):
         """
         Parameters
@@ -405,24 +430,26 @@ class BERTTrainer:
         """
         texts  = self.build_texts(df)
         labels = df[label_col].values
-        
+
+        # [4] Tính class weights từ toàn bộ train set
+        self.class_weights = compute_class_weights(labels, self.num_classes)
+
         skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=42)
         self.oof_preds = np.zeros(len(df), dtype=int)
-        
+
         for fold, (train_idx, val_idx) in enumerate(skf.split(texts, labels)):
             print(f"\n{'='*50}")
             print(f"Fold {fold+1}/{self.n_splits}")
             print(f"{'='*50}")
-            
+
             train_texts  = [texts[i] for i in train_idx]
             val_texts    = [texts[i] for i in val_idx]
             train_labels = labels[train_idx].tolist()
             val_labels   = labels[val_idx].tolist()
-            
+
             train_ds = PaperDataset(train_texts, train_labels, self.tokenizer, self.max_length)
             val_ds   = PaperDataset(val_texts,   val_labels,   self.tokenizer, self.max_length)
 
-            # [D] Dynamic padding qua collate_fn
             train_loader = DataLoader(
                 train_ds, batch_size=self.batch_size, shuffle=True,
                 num_workers=NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"),
@@ -433,21 +460,22 @@ class BERTTrainer:
                 num_workers=NUM_WORKERS, pin_memory=(DEVICE.type == "cuda"),
                 collate_fn=dynamic_collate_fn,
             )
-            
-            model, best_f1 = self._train_fold(train_loader, val_loader, fold)
-            print(f"  → Best val Macro F1: {best_f1:.4f}")
+
+            model, best_qwk = self._train_fold(train_loader, val_loader, fold)
+            print(f"  → Best val QWK: {best_qwk:.4f}")
             self.models.append(model)
-            
+
             val_preds, _ = self._predict_loader(model, val_loader)
-            self.oof_preds[val_idx] = val_preds + 1  # 0-4 → 1-5
-            
-        macro_f1 = f1_score(labels, self.oof_preds, average="macro")
+            self.oof_preds[val_idx] = val_preds
+
+        oof_qwk = cohen_kappa_score(labels, self.oof_preds, weights="quadratic")
+        oof_f1  = f1_score(labels, self.oof_preds, average="macro")
         print(f"\n{'='*50}")
-        print(f"Overall OOF Macro F1: {macro_f1:.4f}")
+        print(f"Overall OOF QWK    : {oof_qwk:.4f}")
+        print(f"Overall OOF Macro F1: {oof_f1:.4f}")
         print(f"{'='*50}")
-        return macro_f1
-    
-    #  Public: predict test set 
+        return oof_qwk
+
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         """
         Ensemble predict: average softmax prob từ tất cả fold models.
@@ -472,7 +500,8 @@ class BERTTrainer:
                     fold_probs.append(torch.softmax(logits, dim=1).cpu().numpy())
             all_probs += np.vstack(fold_probs)
         all_probs /= len(self.models)
-        return np.argmax(all_probs, axis=1) + 1
+        # [G] Expected-rank decode trên ensemble probs
+        return expected_rank_decode(all_probs, self.num_classes)
 
     def save_models(self, save_dir: str):
         os.makedirs(save_dir, exist_ok=True)
