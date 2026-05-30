@@ -225,7 +225,7 @@ class BERTTrainer:
             optimizer, max_lr=self.lr, total_steps=total_steps, pct_start=0.1,
         )
 
-        best_val_loss = float('inf')
+        best_qwk = -1.0
         best_state = None
         no_improve = 0
         
@@ -265,7 +265,7 @@ class BERTTrainer:
             temp_preds_rounded = np.clip(np.round(val_preds), 1, 5)
             val_qwk = cohen_kappa_score(val_labels, temp_preds_rounded, weights="quadratic")
 
-            flag = ("✔ best" if val_loss < best_val_loss 
+            flag = ("✔ best" if val_qwk > best_qwk 
                     else f"(no improve {no_improve+1}/{self.early_stopping})")
             print(f"  Epoch {epoch+1:>2}/{self.epochs} "
                   f"train_mse={avg_loss:.4f} "
@@ -273,9 +273,9 @@ class BERTTrainer:
                   f"val_qwk_temp={val_qwk:.4f} "
                   f"{flag}")
 
-            # Checkpoint lưu theo val_loss (Regression thì theo dõi MSE là chuẩn nhất)
-            if val_loss < best_val_loss:
-                best_val_loss, no_improve = val_loss, 0
+            # Checkpoint lưu theo qmk (Regression thì theo dõi MSE là chuẩn nhất)
+            if val_qwk > best_qwk:
+                best_qwk, no_improve = val_qwk, 0
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             else:
                 no_improve += 1
