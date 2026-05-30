@@ -39,9 +39,7 @@ class OptimizedRounder:
         self.coef_ = 0
 
     def _kappa_loss(self, coef, X, y):
-        # Bắt buộc các ngưỡng phải tăng dần để if-elif hoạt động đúng
         coef = np.sort(coef) 
-        
         X_p = np.copy(X)
         for i, pred in enumerate(X_p):
             if pred < coef[0]:   X_p[i] = 1
@@ -51,16 +49,15 @@ class OptimizedRounder:
             else:                X_p[i] = 5
         return -cohen_kappa_score(y, X_p, weights='quadratic')
 
-    def fit(self, X, y):
+    def fit(self, X, y, verbose=True):
         loss_partial = partial(self._kappa_loss, X=X, y=y)
         initial_coef = [1.5, 2.5, 3.5, 4.5]
         self.rounder = sp_opt.minimize(loss_partial, initial_coef, method='nelder-mead')
-        #Sort lại hệ số cuối cùng cho chắc chắn
         self.coef_ = np.sort(self.rounder.x) 
-        print(f"Optimized Thresholds: {np.round(self.coef_, 4)}")
+        if verbose:
+            print(f"Optimized Thresholds: {np.round(self.coef_, 4)}")
 
     def predict(self, X, coef):
-        # Đảm bảo sort trước khi predict
         coef = np.sort(coef) 
         X_p = np.copy(X)
         for i, pred in enumerate(X_p):
@@ -153,7 +150,7 @@ def make_llrd_optimizer(model: BERTOrdinalRegressor, base_lr: float, decay: floa
     return torch.optim.AdamW(param_groups, weight_decay=0.01)
 
 
-# ── [6] Trainer ────────────────────────────────────────────────────────────────
+# ── [6] Trainer (Tích hợp Sample Weighting & Per-Epoch QWK) ────────────────────
 class BERTTrainer:
     def __init__(
         self,
@@ -187,7 +184,6 @@ class BERTTrainer:
         for _, row in df.iterrows():
             title    = str(row.get("title",    "")).strip()
             abstract = str(row.get("abstract", "")).strip()
-            venue    = str(row.get("venue",    "")).strip()
             year     = str(row.get("year",     "")).strip()
             authors  = str(row.get("authors",  "")).strip()
             
@@ -221,8 +217,8 @@ class BERTTrainer:
             model.train()
             total_loss = 0
             
-            # Sử dụng Huber Loss (SmoothL1Loss) thay cho MSE
-            criterion = nn.SmoothL1Loss(beta=1.0) 
+            # [TÍCH HỢP 1]: Loss tách rời từng sample để nhân trọng số
+            criterion = nn.SmoothL1Loss(beta=1.0, reduction='none') 
 
             for batch in train_loader:
                 input_ids      = batch["input_ids"].to(DEVICE)
@@ -232,7 +228,13 @@ class BERTTrainer:
                 optimizer.zero_grad()
                 preds = model(input_ids, attention_mask)
                 
-                loss = criterion(preds, labels)
+                # Tính Loss thô
+                raw_loss = criterion(preds, labels)
+                
+                # Áp dụng Sample Weights
+                label_indices = (labels.long() - 1).clamp(0, 4)
+                sample_weights = self.class_weights[label_indices]
+                loss = (raw_loss * sample_weights).mean()
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -243,18 +245,22 @@ class BERTTrainer:
             avg_loss = total_loss / len(train_loader)
 
             val_preds, val_labels = self._predict_loader(model, val_loader)
-            
             val_loss = np.mean((val_preds - val_labels)**2)
             
-            temp_preds_rounded = np.clip(np.round(val_preds), 1, 5)
-            val_qwk = cohen_kappa_score(val_labels, temp_preds_rounded, weights="quadratic")
+            # [TÍCH HỢP 2]: Tính điểm QWK thực tế của epoch này thông qua Rounder
+            epoch_rounder = OptimizedRounder()
+            epoch_rounder.fit(val_preds, val_labels, verbose=False) # Ẩn log
+            epoch_preds = epoch_rounder.predict(val_preds, epoch_rounder.coef_)
+            val_qwk_opt = cohen_kappa_score(val_labels, epoch_preds, weights="quadratic")
 
+            # Quyết định lưu mô hình theo val_loss (Đảm bảo phân phối tốt nhất)
             flag = ("✔ best" if val_loss < best_val_loss 
                     else f"(no improve {no_improve+1}/{self.early_stopping})")
+            
             print(f"  Epoch {epoch+1:>2}/{self.epochs} "
                   f"train_loss={avg_loss:.4f} "
                   f"val_mse={val_loss:.4f} "
-                  f"val_qwk_temp={val_qwk:.4f} "
+                  f"val_qwk_opt={val_qwk_opt:.4f} " 
                   f"{flag}")
 
             if val_loss < best_val_loss:
@@ -287,7 +293,7 @@ class BERTTrainer:
         texts  = self.build_texts(df)
         labels = df[label_col].values
 
-        # Tính toán nhưng không cần dùng class weights trong hàm Loss nữa
+        # Tính class_weights cho tập train
         self.class_weights = compute_class_weights(labels, 5)
         skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=42)
         
@@ -324,7 +330,7 @@ class BERTTrainer:
             self.oof_raw_preds[val_idx] = val_preds
 
         print(f"\n{'='*50}")
-        print("Đang tối ưu hóa ngưỡng cắt (Threshold Optimization)...")
+        print("Đang tối ưu hóa ngưỡng cắt toàn cục (Global Threshold Optimization)...")
         self.rounder.fit(self.oof_raw_preds, labels)
         
         final_oof_preds = self.rounder.predict(self.oof_raw_preds, self.rounder.coef_)
