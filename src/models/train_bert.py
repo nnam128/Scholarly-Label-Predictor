@@ -26,10 +26,6 @@ NUM_WORKERS = 0 if DEVICE.type == "cpu" else 2
 
 # ── [1] Class weights helper ───────────────────────────────────────────────────
 def compute_class_weights(labels: np.ndarray, num_classes: int = 5) -> torch.Tensor:
-    """
-    Giữ nguyên logic tính weights để xử lý imbalance, 
-    nhưng sẽ áp dụng cho MSE Loss của Regression.
-    """
     counts  = np.bincount(labels - 1, minlength=num_classes).astype(float)
     weights = len(labels) / (num_classes * counts)
     weights = weights / weights.mean()
@@ -39,14 +35,13 @@ def compute_class_weights(labels: np.ndarray, num_classes: int = 5) -> torch.Ten
 
 # ── [2] Optimized Rounder ──────────────────────────
 class OptimizedRounder:
-    """
-    Tự động tìm ngưỡng cắt (thresholds) tối ưu thay vì làm tròn 1.5, 2.5...
-    Giúp tối đa hóa điểm QWK trên tập OOF (Out-Of-Fold).
-    """
     def __init__(self):
         self.coef_ = 0
 
     def _kappa_loss(self, coef, X, y):
+        # Bắt buộc các ngưỡng phải tăng dần để if-elif hoạt động đúng
+        coef = np.sort(coef) 
+        
         X_p = np.copy(X)
         for i, pred in enumerate(X_p):
             if pred < coef[0]:   X_p[i] = 1
@@ -54,18 +49,19 @@ class OptimizedRounder:
             elif pred < coef[2]: X_p[i] = 3
             elif pred < coef[3]: X_p[i] = 4
             else:                X_p[i] = 5
-        # scipy optimize tìm giá trị nhỏ nhất -> trả về âm QWK
         return -cohen_kappa_score(y, X_p, weights='quadratic')
 
     def fit(self, X, y):
         loss_partial = partial(self._kappa_loss, X=X, y=y)
-        # Khởi tạo ngưỡng ban đầu ở giữa các class
         initial_coef = [1.5, 2.5, 3.5, 4.5]
         self.rounder = sp_opt.minimize(loss_partial, initial_coef, method='nelder-mead')
-        self.coef_ = self.rounder.x
+        #Sort lại hệ số cuối cùng cho chắc chắn
+        self.coef_ = np.sort(self.rounder.x) 
         print(f"Optimized Thresholds: {np.round(self.coef_, 4)}")
 
     def predict(self, X, coef):
+        # Đảm bảo sort trước khi predict
+        coef = np.sort(coef) 
         X_p = np.copy(X)
         for i, pred in enumerate(X_p):
             if pred < coef[0]:   X_p[i] = 1
@@ -76,7 +72,7 @@ class OptimizedRounder:
         return X_p.astype(int)
 
 
-# ── [3] Dataset với Dynamic Padding ────────────────────────────────────────────
+# ── [3] Dataset ────────────────────────────────────────────
 class PaperDataset(Dataset):
     def __init__(self, texts: list, labels: Optional[list], tokenizer, max_length: int = 512):
         self.texts = texts
@@ -99,7 +95,6 @@ class PaperDataset(Dataset):
             "attention_mask": encoding["attention_mask"].squeeze(0),
         }
         if self.labels is not None:
-            # [Cập nhật] Regression giữ nguyên nhãn 1-5 dưới dạng float
             item["labels"] = torch.tensor(self.labels[idx], dtype=torch.float32)
         return item
 
@@ -114,11 +109,8 @@ def dynamic_collate_fn(batch):
     return result
 
 
-# ── [4] Model: BERT Regression (Thay vì Classification) ────────────────────────
+# ── [4] Model: BERT Regression ────────────────────────
 class BERTOrdinalRegressor(nn.Module):
-    """
-    Kiến trúc Hồi quy (Regression). Xuất ra 1 giá trị float duy nhất.
-    """
     def __init__(self, model_name: str = "allenai/scibert_scivocab_uncased", dropout: float = 0.2):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name)
@@ -129,7 +121,7 @@ class BERTOrdinalRegressor(nn.Module):
             nn.Linear(hidden, 256),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 1), # [Cập nhật] 1 node output
+            nn.Linear(256, 1),
         )
         
     def forward(self, input_ids, attention_mask):
@@ -140,7 +132,6 @@ class BERTOrdinalRegressor(nn.Module):
         count     = mask.sum(dim=1).clamp(min=1e-9)
         pooled    = sum_emb / count
         
-        # Trả về shape (Batch_size,)
         return self.regressor(pooled).squeeze(-1)
 
 
@@ -186,7 +177,7 @@ class BERTTrainer:
 
         self.tokenizer     = AutoTokenizer.from_pretrained(model_name)
         self.models        = []
-        self.oof_raw_preds = None  # Chứa dự đoán float chưa làm tròn
+        self.oof_raw_preds = None  
         self.class_weights = None
         self.rounder       = OptimizedRounder()
 
@@ -200,22 +191,19 @@ class BERTTrainer:
             year     = str(row.get("year",     "")).strip()
             authors  = str(row.get("authors",  "")).strip()
             
-            # Chỉ lấy 3 tác giả đầu để tiết kiệm token
             author_list   = [a.strip() for a in authors.split(",") if a.strip()]
             authors_short = ", ".join(author_list[:3])
             if len(author_list) > 3:
                 authors_short += " et al."
                 
             texts.append(
-                #f"venue: {venue} "
                 f"year: {year} "
                 f"authors: {authors_short} "
                 f"title: {title} "
-                f"[SEP] abstract: {abstract}"
+                #f"[SEP] abstract: {abstract}"
             )
         return texts
     
-    #  train 1 fold 
     def _train_fold(self, train_loader, val_loader, fold: int):
         model     = BERTOrdinalRegressor(self.model_name).to(DEVICE)
         optimizer = make_llrd_optimizer(model, self.lr, self.llrd_decay)
@@ -225,7 +213,7 @@ class BERTTrainer:
             optimizer, max_lr=self.lr, total_steps=total_steps, pct_start=0.1,
         )
 
-        best_qwk = -1.0
+        best_val_loss = float('inf') 
         best_state = None
         no_improve = 0
         
@@ -234,7 +222,6 @@ class BERTTrainer:
             total_loss = 0
             
             # Sử dụng Huber Loss (SmoothL1Loss) thay cho MSE
-            # Giúp mô hình không bị hoảng loạn bởi các điểm dữ liệu nhiễu
             criterion = nn.SmoothL1Loss(beta=1.0) 
 
             for batch in train_loader:
@@ -245,7 +232,6 @@ class BERTTrainer:
                 optimizer.zero_grad()
                 preds = model(input_ids, attention_mask)
                 
-                # Tính loss trực tiếp, BỎ tính sample_weights
                 loss = criterion(preds, labels)
 
                 loss.backward()
@@ -258,24 +244,21 @@ class BERTTrainer:
 
             val_preds, val_labels = self._predict_loader(model, val_loader)
             
-            # Tính val_loss (MSE) để early stopping
             val_loss = np.mean((val_preds - val_labels)**2)
             
-            # Tính tạm QWK bằng cách làm tròn cứng (hard round) để theo dõi
             temp_preds_rounded = np.clip(np.round(val_preds), 1, 5)
             val_qwk = cohen_kappa_score(val_labels, temp_preds_rounded, weights="quadratic")
 
-            flag = ("✔ best" if val_qwk > best_qwk 
+            flag = ("✔ best" if val_loss < best_val_loss 
                     else f"(no improve {no_improve+1}/{self.early_stopping})")
             print(f"  Epoch {epoch+1:>2}/{self.epochs} "
-                  f"train_mse={avg_loss:.4f} "
+                  f"train_loss={avg_loss:.4f} "
                   f"val_mse={val_loss:.4f} "
                   f"val_qwk_temp={val_qwk:.4f} "
                   f"{flag}")
 
-            # Checkpoint lưu theo qmk (Regression thì theo dõi MSE là chuẩn nhất)
-            if val_qwk > best_qwk:
-                best_qwk, no_improve = val_qwk, 0
+            if val_loss < best_val_loss:
+                best_val_loss, no_improve = val_loss, 0
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             else:
                 no_improve += 1
@@ -284,11 +267,10 @@ class BERTTrainer:
                     break
 
         model.load_state_dict(best_state)
-        return model, best_qwk
+        return model, best_val_loss
 
     @staticmethod
     def _predict_loader(model, loader) -> tuple:
-        """ Trả về dự đoán thô (float) và nhãn thực (1-5) """
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
@@ -305,6 +287,7 @@ class BERTTrainer:
         texts  = self.build_texts(df)
         labels = df[label_col].values
 
+        # Tính toán nhưng không cần dùng class weights trong hàm Loss nữa
         self.class_weights = compute_class_weights(labels, 5)
         skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=42)
         
@@ -340,12 +323,10 @@ class BERTTrainer:
             val_preds, _ = self._predict_loader(model, val_loader)
             self.oof_raw_preds[val_idx] = val_preds
 
-        # [Cập nhật] Sau khi chạy xong 5 fold, dùng OptimizedRounder để tìm ngưỡng
         print(f"\n{'='*50}")
         print("Đang tối ưu hóa ngưỡng cắt (Threshold Optimization)...")
         self.rounder.fit(self.oof_raw_preds, labels)
         
-        # Tính điểm cuối cùng bằng ngưỡng vừa tìm được
         final_oof_preds = self.rounder.predict(self.oof_raw_preds, self.rounder.coef_)
         oof_qwk = cohen_kappa_score(labels, final_oof_preds, weights="quadratic")
         oof_f1  = f1_score(labels, final_oof_preds, average="macro")
@@ -378,7 +359,6 @@ class BERTTrainer:
             
         all_preds /= len(self.models)
         
-        # Áp dụng ngưỡng cắt đã được tối ưu
         return self.rounder.predict(all_preds, self.rounder.coef_)
 
     def save_models(self, save_dir: str):
@@ -387,7 +367,6 @@ class BERTTrainer:
             path = os.path.join(save_dir, f"bert_fold_{i+1}.pt")
             torch.save(model.state_dict(), path)
             print(f"Saved: {path}")
-        # Lưu trữ mốc threshold của rounder
         np.save(os.path.join(save_dir, "rounder_coefs.npy"), self.rounder.coef_)
             
     def load_models(self, save_dir: str):
@@ -399,7 +378,6 @@ class BERTTrainer:
             model.to(DEVICE)
             self.models.append(model)
             print(f"Loaded: {path}")
-        # Load mốc threshold
         coef_path = os.path.join(save_dir, "rounder_coefs.npy")
         if os.path.exists(coef_path):
             self.rounder.coef_ = np.load(coef_path)
