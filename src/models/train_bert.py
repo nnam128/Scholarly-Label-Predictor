@@ -230,9 +230,13 @@ class BERTTrainer:
         no_improve = 0
         
         for epoch in range(self.epochs):
-            #  train 
             model.train()
             total_loss = 0
+            
+            # Sử dụng Huber Loss (SmoothL1Loss) thay cho MSE
+            # Giúp mô hình không bị hoảng loạn bởi các điểm dữ liệu nhiễu
+            criterion = nn.SmoothL1Loss(beta=1.0) 
+
             for batch in train_loader:
                 input_ids      = batch["input_ids"].to(DEVICE)
                 attention_mask = batch["attention_mask"].to(DEVICE)
@@ -241,9 +245,8 @@ class BERTTrainer:
                 optimizer.zero_grad()
                 preds = model(input_ids, attention_mask)
                 
-                # [Cập nhật] Weighted MSE Loss
-                sample_weights = self.class_weights[(labels - 1).long()]
-                loss = (sample_weights * (preds - labels)**2).mean()
+                # Tính loss trực tiếp, BỎ tính sample_weights
+                loss = criterion(preds, labels)
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
