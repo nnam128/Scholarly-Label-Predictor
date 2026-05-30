@@ -150,7 +150,7 @@ def make_llrd_optimizer(model: BERTOrdinalRegressor, base_lr: float, decay: floa
     return torch.optim.AdamW(param_groups, weight_decay=0.01)
 
 
-# ── [6] Trainer ( Improve theo QWK và lưu Threshold riêng) ───
+# ── [6] Trainer (Global Threshold + Early Stopping bằng QWK) ───────────────────
 class BERTTrainer:
     def __init__(
         self,
@@ -172,12 +172,11 @@ class BERTTrainer:
         self.n_splits       = n_splits
         self.llrd_decay     = llrd_decay
 
-        self.tokenizer       = AutoTokenizer.from_pretrained(model_name)
-        self.models          = []
-        self.fold_thresholds = []
-        self.oof_final_preds = None  
-        self.class_weights   = None
-        self.rounder         = OptimizedRounder()
+        self.tokenizer     = AutoTokenizer.from_pretrained(model_name)
+        self.models        = []
+        self.oof_raw_preds = None  
+        self.class_weights = None
+        self.rounder       = OptimizedRounder()
 
     @staticmethod
     def build_texts(df: pd.DataFrame) -> list:
@@ -211,14 +210,14 @@ class BERTTrainer:
         )
 
         best_val_qwk = -1.0
-        best_state   = None
-        best_coef    = None
-        no_improve   = 0
+        best_state = None
+        no_improve = 0
         
         for epoch in range(self.epochs):
             model.train()
             total_loss = 0
             
+            # Loss tách rời từng sample để nhân trọng số
             criterion = nn.SmoothL1Loss(beta=1.0, reduction='none') 
 
             for batch in train_loader:
@@ -229,8 +228,10 @@ class BERTTrainer:
                 optimizer.zero_grad()
                 preds = model(input_ids, attention_mask)
                 
+                # Tính Loss thô
                 raw_loss = criterion(preds, labels)
                 
+                # Áp dụng Sample Weights
                 label_indices = (labels.long() - 1).clamp(0, 4)
                 sample_weights = self.class_weights[label_indices]
                 loss = (raw_loss * sample_weights).mean()
@@ -246,6 +247,7 @@ class BERTTrainer:
             val_preds, val_labels = self._predict_loader(model, val_loader)
             val_loss = np.mean((val_preds - val_labels)**2)
             
+            # Tính điểm QWK tạm thời của epoch này để theo dõi tiến độ
             epoch_rounder = OptimizedRounder()
             epoch_rounder.fit(val_preds, val_labels, verbose=False) 
             epoch_preds = epoch_rounder.predict(val_preds, epoch_rounder.coef_)
@@ -265,7 +267,6 @@ class BERTTrainer:
                 best_val_qwk = val_qwk_opt
                 no_improve = 0
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                best_coef  = epoch_rounder.coef_.copy() # Khóa chặt Threshold tại epoch xuất sắc này lại
             else:
                 no_improve += 1
                 if no_improve >= self.early_stopping:
@@ -273,7 +274,7 @@ class BERTTrainer:
                     break
 
         model.load_state_dict(best_state)
-        return model, best_coef # Trả về cả model và Threshold đi kèm của nó
+        return model
 
     @staticmethod
     def _predict_loader(model, loader) -> tuple:
@@ -293,11 +294,11 @@ class BERTTrainer:
         texts  = self.build_texts(df)
         labels = df[label_col].values
 
+        # Tính class_weights cho tập train
         self.class_weights = compute_class_weights(labels, 5)
         skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=42)
         
-        self.fold_thresholds = [] 
-        self.oof_final_preds = np.zeros(len(df), dtype=int) # Lưu trực tiếp nhãn int đã qua phân ngưỡng riêng
+        self.oof_raw_preds = np.zeros(len(df), dtype=float) # Trở lại lưu Raw Preds
 
         for fold, (train_idx, val_idx) in enumerate(skf.split(texts, labels)):
             print(f"\n{'='*50}")
@@ -323,23 +324,24 @@ class BERTTrainer:
                 collate_fn=dynamic_collate_fn,
             )
 
-            # Thu thập model kèm Threshold tương ứng của fold
-            model, fold_coef = self._train_fold(train_loader, val_loader, fold)
+            model = self._train_fold(train_loader, val_loader, fold)
             self.models.append(model)
-            self.fold_thresholds.append(fold_coef)
-            print(f"  -> Fold {fold+1} Saved Threshold: {np.round(fold_coef, 4)}")
 
-            # Tính toán và chốt nhãn OOF cho Fold này bằng chính Threshold riêng của nó
+            # Thu thập toàn bộ raw predictions (không threshold)
             val_preds, _ = self._predict_loader(model, val_loader)
-            self.oof_final_preds[val_idx] = self.rounder.predict(val_preds, fold_coef)
+            self.oof_raw_preds[val_idx] = val_preds
 
         print(f"\n{'='*50}")
-        # Không cần chạy Nelder-Mead toàn cục nữa, chấm điểm dựa trên nhãn kết hợp từ các Fold độc lập
-        oof_qwk = cohen_kappa_score(labels, self.oof_final_preds, weights="quadratic")
-        oof_f1  = f1_score(labels, self.oof_final_preds, average="macro")
+        print("Đang tối ưu hóa ngưỡng cắt toàn cục (Global Threshold Optimization)...")
+        # Global Optimization: Tối ưu 1 lần trên toàn bộ tập OOF
+        self.rounder.fit(self.oof_raw_preds, labels)
         
-        print(f"Overall OOF QWK (Per-Fold Thresholds) : {oof_qwk:.4f}")
-        print(f"Overall OOF Macro F1                  : {oof_f1:.4f}")
+        final_oof_preds = self.rounder.predict(self.oof_raw_preds, self.rounder.coef_)
+        oof_qwk = cohen_kappa_score(labels, final_oof_preds, weights="quadratic")
+        oof_f1  = f1_score(labels, final_oof_preds, average="macro")
+        
+        print(f"Overall OOF QWK    : {oof_qwk:.4f}")
+        print(f"Overall OOF Macro F1: {oof_f1:.4f}")
         print(f"{'='*50}")
         return oof_qwk
 
@@ -352,8 +354,8 @@ class BERTTrainer:
             collate_fn=dynamic_collate_fn,
         )
         
-        all_fold_preds = []
-        for i, model in enumerate(self.models):
+        all_preds = np.zeros(len(texts))
+        for model in self.models:
             model.eval()
             model.to(DEVICE)
             fold_preds = []
@@ -362,13 +364,14 @@ class BERTTrainer:
                     preds = model(batch["input_ids"].to(DEVICE),
                                   batch["attention_mask"].to(DEVICE))
                     fold_preds.extend(preds.cpu().numpy())
+            # Cộng dồn raw predictions
+            all_preds += np.array(fold_preds)
             
-            # Khớp dự đoán thô của từng mô hình fold với chính bộ Threshold lưu trữ riêng của nó
-            fold_classes = self.rounder.predict(np.array(fold_preds), self.fold_thresholds[i])
-            all_fold_preds.append(fold_classes)
-            
-        # Ensemble bằng cách lấy Trung vị (Median) từ kết quả nhãn nguyên của 5 Fold
-        return np.median(all_fold_preds, axis=0).astype(int)
+        # Trung bình raw predictions từ 5 folds
+        all_preds /= len(self.models)
+        
+        # Áp dụng Global Threshold ở bước cuối cùng
+        return self.rounder.predict(all_preds, self.rounder.coef_)
 
     def save_models(self, save_dir: str):
         os.makedirs(save_dir, exist_ok=True)
@@ -376,7 +379,8 @@ class BERTTrainer:
             path = os.path.join(save_dir, f"bert_fold_{i+1}.pt")
             torch.save(model.state_dict(), path)
             print(f"Saved: {path}")
-        np.save(os.path.join(save_dir, "fold_thresholds.npy"), np.array(self.fold_thresholds))
+        # Lưu duy nhất 1 bộ Threshold toàn cục
+        np.save(os.path.join(save_dir, "rounder_coefs.npy"), self.rounder.coef_)
             
     def load_models(self, save_dir: str):
         self.models = []
@@ -387,7 +391,7 @@ class BERTTrainer:
             model.to(DEVICE)
             self.models.append(model)
             print(f"Loaded: {path}")
-        coef_path = os.path.join(save_dir, "fold_thresholds.npy")
+        coef_path = os.path.join(save_dir, "rounder_coefs.npy")
         if os.path.exists(coef_path):
-            self.fold_thresholds = list(np.load(coef_path))
-            print("Loaded Fold Thresholds successfully.")
+            self.rounder.coef_ = np.load(coef_path)
+            print(f"Loaded Global Thresholds: {self.rounder.coef_}")
