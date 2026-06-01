@@ -18,7 +18,7 @@ from functools import partial
 
 warnings.filterwarnings("ignore")
 
-#  Device
+# ── [0] Device & Settings ──────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 NUM_WORKERS = 0 if DEVICE.type == "cpu" else 2
@@ -33,7 +33,7 @@ def compute_class_weights(labels: np.ndarray, num_classes: int = 5) -> torch.Ten
     return torch.tensor(weights, dtype=torch.float32).to(DEVICE)
 
 
-# ── [2] Optimized Rounder ──────────────────────────
+# ── [2] Optimized Rounder ──────────────────────────────────────────────────────
 class OptimizedRounder:
     def __init__(self):
         self.coef_ = 0
@@ -69,7 +69,7 @@ class OptimizedRounder:
         return X_p.astype(int)
 
 
-# ── [3] Dataset ────────────────────────────────────────────
+# ── [3] Dataset ────────────────────────────────────────────────────────────────
 class PaperDataset(Dataset):
     def __init__(self, texts: list, labels: Optional[list], tokenizer, max_length: int = 512):
         self.texts = texts
@@ -106,51 +106,89 @@ def dynamic_collate_fn(batch):
     return result
 
 
-# ── [4] Model: BERT Regression ────────────────────────
+# ── [4] Model: BERT Regression (Đã nâng cấp) ──────────────────────────────────
 class BERTOrdinalRegressor(nn.Module):
-    def __init__(self, model_name: str = "allenai/scibert_scivocab_uncased", dropout: float = 0.2):
+    def __init__(self, model_name: str = "allenai/scibert_scivocab_uncased"):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name)
         hidden = self.bert.config.hidden_size
         
-        self.regressor = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 256),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 1),
-        )
+        # [CẢI TIẾN]: Multi-Sample Dropout giúp model ổn định hơn
+        self.dropouts = nn.ModuleList([nn.Dropout(p) for p in np.linspace(0.1, 0.5, 5)])
+        
+        # Kích thước input là hidden * 2 vì ta sẽ nối CLS pooling và Mean pooling
+        self.fc = nn.Linear(hidden * 2, 1)
         
     def forward(self, input_ids, attention_mask):
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         token_emb = out.last_hidden_state
+        
+        # [CẢI TIẾN]: CLS Pooling
+        cls_token = token_emb[:, 0, :]
+        
+        # [CẢI TIẾN]: Mean Pooling
         mask      = attention_mask.unsqueeze(-1).float()
         sum_emb   = (token_emb * mask).sum(dim=1)
         count     = mask.sum(dim=1).clamp(min=1e-9)
-        pooled    = sum_emb / count
+        mean_pooled = sum_emb / count
         
-        return self.regressor(pooled).squeeze(-1)
+        # [CẢI TIẾN]: Concatenate CLS và Mean Pooling để biểu diễn phong phú hơn
+        concat_pooled = torch.cat((cls_token, mean_pooled), dim=1)
+        
+        # [CẢI TIẾN]: Đi qua Multi-Sample Dropout và lấy trung bình
+        outputs = torch.mean(
+            torch.stack([self.fc(dropout(concat_pooled)) for dropout in self.dropouts], dim=0), 
+            dim=0
+        )
+        
+        return outputs.squeeze(-1)
 
 
-# ── [5] LLRD Optimizer ─────────────────────────────────────────────────────────
+# ── [5] LLRD Optimizer (Đã loại bỏ Decay cho Bias/LayerNorm) ─────────────────
 def make_llrd_optimizer(model: BERTOrdinalRegressor, base_lr: float, decay: float = 0.9) -> torch.optim.AdamW:
+    no_decay = ["bias", "LayerNorm.weight"]
+    param_groups = []
     num_layers = model.bert.config.num_hidden_layers
-    param_groups = [{"params": model.regressor.parameters(), "lr": base_lr}]
+
+    # Nhóm tham số của tầng Linear (Head)
+    param_groups.append({
+        "params": [p for n, p in model.fc.named_parameters() if not any(nd in n for nd in no_decay)],
+        "lr": base_lr, "weight_decay": 0.01
+    })
+    param_groups.append({
+        "params": [p for n, p in model.fc.named_parameters() if any(nd in n for nd in no_decay)],
+        "lr": base_lr, "weight_decay": 0.0
+    })
+
+    # Nhóm tham số của các tầng Encoder (giảm LR dần)
     for layer_idx in range(num_layers - 1, -1, -1):
         layer_lr = base_lr * (decay ** (num_layers - layer_idx))
+        layer = model.bert.encoder.layer[layer_idx]
+        
         param_groups.append({
-            "params": model.bert.encoder.layer[layer_idx].parameters(),
-            "lr": layer_lr,
+            "params": [p for n, p in layer.named_parameters() if not any(nd in n for nd in no_decay)],
+            "lr": layer_lr, "weight_decay": 0.01
         })
+        param_groups.append({
+            "params": [p for n, p in layer.named_parameters() if any(nd in n for nd in no_decay)],
+            "lr": layer_lr, "weight_decay": 0.0
+        })
+
+    # Nhóm tham số của Embeddings
     embed_lr = base_lr * (decay ** (num_layers + 1))
     param_groups.append({
-        "params": model.bert.embeddings.parameters(),
-        "lr": embed_lr,
+        "params": [p for n, p in model.bert.embeddings.named_parameters() if not any(nd in n for nd in no_decay)],
+        "lr": embed_lr, "weight_decay": 0.01
     })
-    return torch.optim.AdamW(param_groups, weight_decay=0.01)
+    param_groups.append({
+        "params": [p for n, p in model.bert.embeddings.named_parameters() if any(nd in n for nd in no_decay)],
+        "lr": embed_lr, "weight_decay": 0.0
+    })
+
+    return torch.optim.AdamW(param_groups)
 
 
-# ── [6] Trainer (Tích hợp Sample Weighting & Per-Epoch QWK) ────────────────────
+# ── [6] Trainer (Tối ưu Training Loop & Logic Early Stopping) ──────────────────
 class BERTTrainer:
     def __init__(
         self,
@@ -178,9 +216,11 @@ class BERTTrainer:
         self.class_weights = None
         self.rounder       = OptimizedRounder()
 
-    @staticmethod
-    def build_texts(df: pd.DataFrame) -> list:
+    def build_texts(self, df: pd.DataFrame) -> list:
         texts = []
+        # Dùng token [SEP] của tokenizer để phân tách rõ ràng mạch ngữ nghĩa
+        sep = self.tokenizer.sep_token if self.tokenizer.sep_token else "[SEP]"
+        
         for _, row in df.iterrows():
             title    = str(row.get("title",    "")).strip()
             abstract = str(row.get("abstract", "")).strip()
@@ -192,11 +232,9 @@ class BERTTrainer:
             if len(author_list) > 3:
                 authors_short += " et al."
                 
+            # [CẢI TIẾN]: Đẩy title và abstract lên trước để BERT chú ý tốt hơn, metadata ở cuối
             texts.append(
-                f"year: {year} "
-                f"authors: {authors_short} "
-                f"title: {title} "
-                f"[SEP] abstract: {abstract}"
+                f"{title} {sep} {abstract} {sep} year: {year}, authors: {authors_short}"
             )
         return texts
     
@@ -209,37 +247,46 @@ class BERTTrainer:
             optimizer, max_lr=self.lr, total_steps=total_steps, pct_start=0.1,
         )
 
-        best_val_loss = float('inf') 
+        # [CẢI TIẾN]: Khởi tạo GradScaler cho AMP (Automatic Mixed Precision)
+        scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))
+
+        # [CẢI TIẾN]: Lưu mô hình dựa trên QWK cao nhất thay vì MSE thấp nhất
+        best_val_qwk = -float('inf') 
         best_state = None
         no_improve = 0
+        criterion = nn.SmoothL1Loss(beta=1.0, reduction='none')
         
         for epoch in range(self.epochs):
             model.train()
             total_loss = 0
             
-            # [TÍCH HỢP 1]: Loss tách rời từng sample để nhân trọng số
-            criterion = nn.SmoothL1Loss(beta=1.0, reduction='none') 
-
             for batch in train_loader:
                 input_ids      = batch["input_ids"].to(DEVICE)
                 attention_mask = batch["attention_mask"].to(DEVICE)
                 labels         = batch["labels"].to(DEVICE)
                 
                 optimizer.zero_grad()
-                preds = model(input_ids, attention_mask)
                 
-                # Tính Loss thô
-                raw_loss = criterion(preds, labels)
-                
-                # Áp dụng Sample Weights
-                label_indices = (labels.long() - 1).clamp(0, 4)
-                sample_weights = self.class_weights[label_indices]
-                loss = (raw_loss * sample_weights).mean()
+                # [CẢI TIẾN]: Chạy Forward pass với Autocast (tiết kiệm bộ nhớ, tăng tốc độ)
+                with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
+                    preds = model(input_ids, attention_mask)
+                    raw_loss = criterion(preds, labels)
+                    
+                    label_indices = (labels.long() - 1).clamp(0, 4)
+                    sample_weights = self.class_weights[label_indices]
+                    loss = (raw_loss * sample_weights).mean()
 
-                loss.backward()
+                # Backward pass dùng Scaler
+                scaler.scale(loss).backward()
+                
+                # Unscale trước khi clip norm
+                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
+                
                 total_loss += loss.item()
 
             avg_loss = total_loss / len(train_loader)
@@ -247,14 +294,13 @@ class BERTTrainer:
             val_preds, val_labels = self._predict_loader(model, val_loader)
             val_loss = np.mean((val_preds - val_labels)**2)
             
-            # [TÍCH HỢP 2]: Tính điểm QWK thực tế của epoch này thông qua Rounder
             epoch_rounder = OptimizedRounder()
-            epoch_rounder.fit(val_preds, val_labels, verbose=False) # Ẩn log
+            epoch_rounder.fit(val_preds, val_labels, verbose=False)
             epoch_preds = epoch_rounder.predict(val_preds, epoch_rounder.coef_)
             val_qwk_opt = cohen_kappa_score(val_labels, epoch_preds, weights="quadratic")
 
-            # Quyết định lưu mô hình theo val_loss (Đảm bảo phân phối tốt nhất)
-            flag = ("✔ best" if val_loss < best_val_loss 
+            # [CẢI TIẾN]: Quyết định lưu theo val_qwk_opt
+            flag = ("✔ best" if val_qwk_opt > best_val_qwk 
                     else f"(no improve {no_improve+1}/{self.early_stopping})")
             
             print(f"  Epoch {epoch+1:>2}/{self.epochs} "
@@ -263,8 +309,8 @@ class BERTTrainer:
                   f"val_qwk_opt={val_qwk_opt:.4f} " 
                   f"{flag}")
 
-            if val_loss < best_val_loss:
-                best_val_loss, no_improve = val_loss, 0
+            if val_qwk_opt > best_val_qwk:
+                best_val_qwk, no_improve = val_qwk_opt, 0
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             else:
                 no_improve += 1
@@ -273,7 +319,7 @@ class BERTTrainer:
                     break
 
         model.load_state_dict(best_state)
-        return model, best_val_loss
+        return model, best_val_qwk
 
     @staticmethod
     def _predict_loader(model, loader) -> tuple:
@@ -283,8 +329,12 @@ class BERTTrainer:
             for batch in loader:
                 input_ids      = batch["input_ids"].to(DEVICE)
                 attention_mask = batch["attention_mask"].to(DEVICE)
-                preds = model(input_ids, attention_mask)
-                all_preds.extend(preds.cpu().numpy())
+                
+                # Inference với AMP
+                with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
+                    preds = model(input_ids, attention_mask)
+                    
+                all_preds.extend(preds.cpu().float().numpy())
                 if "labels" in batch:
                     all_labels.extend(batch["labels"].numpy())
         return np.array(all_preds), np.array(all_labels)
@@ -293,7 +343,6 @@ class BERTTrainer:
         texts  = self.build_texts(df)
         labels = df[label_col].values
 
-        # Tính class_weights cho tập train
         self.class_weights = compute_class_weights(labels, 5)
         skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=42)
         
@@ -337,7 +386,7 @@ class BERTTrainer:
         oof_qwk = cohen_kappa_score(labels, final_oof_preds, weights="quadratic")
         oof_f1  = f1_score(labels, final_oof_preds, average="macro")
         
-        print(f"Overall OOF QWK    : {oof_qwk:.4f}")
+        print(f"Overall OOF QWK     : {oof_qwk:.4f}")
         print(f"Overall OOF Macro F1: {oof_f1:.4f}")
         print(f"{'='*50}")
         return oof_qwk
@@ -358,9 +407,13 @@ class BERTTrainer:
             fold_preds = []
             with torch.no_grad():
                 for batch in loader:
-                    preds = model(batch["input_ids"].to(DEVICE),
-                                  batch["attention_mask"].to(DEVICE))
-                    fold_preds.extend(preds.cpu().numpy())
+                    input_ids = batch["input_ids"].to(DEVICE)
+                    attention_mask = batch["attention_mask"].to(DEVICE)
+                    
+                    with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):
+                        preds = model(input_ids, attention_mask)
+                        
+                    fold_preds.extend(preds.cpu().float().numpy())
             all_preds += np.array(fold_preds)
             
         all_preds /= len(self.models)
