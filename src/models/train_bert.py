@@ -18,13 +18,13 @@ from functools import partial
 
 warnings.filterwarnings("ignore")
 
-# ── [0] Device & Settings ──────────────────────────────────────────────────────
+#  [0] Device & Settings 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 NUM_WORKERS = 0 if DEVICE.type == "cpu" else 2
 
 
-# ── [1] Tiện ích: Class Weights & FGM ─────────────────────────────────────────
+#  [1] Tiện ích: Class Weights & FGM 
 def compute_class_weights(labels: np.ndarray, num_classes: int = 5) -> torch.Tensor:
     counts  = np.bincount(labels - 1, minlength=num_classes).astype(float)
     weights = len(labels) / (num_classes * counts)
@@ -56,7 +56,7 @@ class FGM:
         self.backup = {}
 
 
-# ── [2] Optimized Rounder (tối ưu đồng thời QWK + Macro F1) ──────────────────
+#  [2] Optimized Rounder (tối ưu đồng thời QWK + Macro F1) 
 class OptimizedRounder:
     def __init__(self):
         self.coef_ = np.array([1.5, 2.5, 3.5, 4.5])
@@ -84,11 +84,6 @@ class OptimizedRounder:
         return -((1 - f1_weight) * qwk + f1_weight * f1)
 
     def fit(self, X, y, f1_weight=0.4, verbose=True):
-        """
-        f1_weight: 0.0 → chỉ tối ưu QWK
-                   0.4 → cân bằng (khuyến nghị)
-                   0.6 → nghiêng về F1
-        """
         loss_fn = partial(self._combined_loss, X=X, y=y, f1_weight=f1_weight)
         initial_coef = [1.5, 2.5, 3.5, 4.5]
         result = sp_opt.minimize(loss_fn, initial_coef, method='nelder-mead')
@@ -106,7 +101,7 @@ class OptimizedRounder:
         return self._predict_from_coef(coef, X)
 
 
-# ── [3] Dataset (Ordinal Frank-Hall targets) ──────────────────────────────────
+#  [3] Dataset (Ordinal Frank-Hall targets) 
 class PaperDataset(Dataset):
     def __init__(self, texts: list, labels: Optional[list], tokenizer, max_length: int = 512):
         self.texts      = texts
@@ -148,7 +143,7 @@ def dynamic_collate_fn(batch):
     return result
 
 
-# ── [4] Model: SciBERT Dual-Head (Ordinal + CE) ───────────────────────────────
+#  [4] Model: SciBERT Dual-Head (Ordinal + CE) 
 class BERTOrdinalRegressor(nn.Module):
     def __init__(self, model_name: str = "allenai/scibert_scivocab_uncased"):
         super().__init__()
@@ -179,7 +174,7 @@ class BERTOrdinalRegressor(nn.Module):
         return ord_out, ce_out
 
 
-# ── [5] LLRD Optimizer ─────────────────────────────────────────────────────────
+#  [5] LLRD Optimizer 
 def make_llrd_optimizer(model: BERTOrdinalRegressor, base_lr: float, decay: float = 0.95):
     no_decay   = ["bias", "LayerNorm.weight"]
     num_layers = model.bert.config.num_hidden_layers
@@ -218,7 +213,7 @@ def make_llrd_optimizer(model: BERTOrdinalRegressor, base_lr: float, decay: floa
     return torch.optim.AdamW(param_groups)
 
 
-# ── [6] BERTTrainer ────────────────────────────────────────────────────────────
+#  [6] BERTTrainer 
 class BERTTrainer:
     def __init__(
         self,
@@ -230,13 +225,10 @@ class BERTTrainer:
         lr:             float = 2e-5,
         n_splits:       int   = 5,
         llrd_decay:     float = 0.95,
-        # ── Trọng số đa nhiệm vụ (tune nếu F1 còn thấp) ──
-        alpha:          float = 0.7,   # weight cho ordinal loss
-        beta:           float = 0.3,   # weight cho CE loss
-        # ── Blend giữa 2 head khi predict ──
-        gamma:          float = 0.6,   # weight cho ordinal head expected value
-        # ── Tối ưu ngưỡng ──
-        f1_weight:      float = 0.4,   # 0.0=chỉ QWK, 0.4=cân bằng, 0.6=nghiêng F1
+        alpha:          float = 0.7,
+        beta:           float = 0.3,
+        gamma:          float = 0.6,
+        f1_weight:      float = 0.4,
     ):
         self.model_name     = model_name
         self.max_length     = max_length
@@ -330,7 +322,7 @@ class BERTTrainer:
 
             avg_loss = total_loss / len(train_loader)
 
-            # ── Validation ──
+            #  Validation 
             val_preds, val_labels = self._predict_loader(model, val_loader, self.gamma)
             epoch_rounder = OptimizedRounder()
             epoch_rounder.fit(val_preds, val_labels, f1_weight=self.f1_weight, verbose=False)
