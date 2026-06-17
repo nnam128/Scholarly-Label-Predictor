@@ -213,7 +213,10 @@ This isolates the Stratified 5-Fold loops, eliminating scheduling overheads and 
 
 ### 2. Multi-Context Prompt Engineering & Tokenization
 Text attributes are combined into a dense semantic format via custom separator tracking. To conserve contextual relationships while handling multi-author sets, names are limited to the first 3 primary contributors with an appended short suffix if truncated:
-$$\text{Prompt} = \text{Title} \parallel \text{[SEP]} \parallel \text{Abstract} \parallel \text{[SEP]} \parallel \text{"year: \{year\}, authors: \{authors\_short\}"}$$
+Prompt:
+```text
+Title [SEP] Abstract [SEP] year: {year}, authors: {authors_short}
+```
 
 The data is wrapped inside a custom PyTorch `PaperDataset` paired with a `dynamic_collate_fn`. Instead of zero-padding every batch globally to a fixed `max_length=256`, sequences are padded dynamically via `nn.utils.rnn.pad_sequence` based on the longest element *within that specific batch*, optimizing VRAM consumption and minimizing dead padding compute.
 
